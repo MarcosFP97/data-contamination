@@ -1,54 +1,70 @@
+from importlib.metadata import files
+from typing import List
 import openai
 import tiktoken
 import xml.etree.ElementTree as ET
 from Levenshtein import ratio
+from bleurt import score
+from rouge_metric import PyRouge
+import numpy as np
+import sys
 
-model = "gpt-4"
-openai.api_key = "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" 
-threshold = 0.4
+model = "gpt-3.5-turbo"
+openai.api_key = "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"
+checkpoint = "BLEURT-20"
+scorer = score.BleurtScorer(checkpoint)
+rouge = PyRouge()
 
 def load_benchmark(
-    path:str
-) -> []:
-    with open(path, 'r') as file:
-        xml_content = file.read()
-
+    year:str,
+    fields:tuple
+) -> List:
+    
     topics = []
-    root = ET.fromstring(xml_content)
+    root = ET.parse(f'../benchmark/misinfo-{year}-topics.xml').getroot()
     for topic in root.findall('topic'):
-        t = ""
-        for element in topic:
-            t+= f"<{element.tag}>{element.text}</{element.tag}>\n"
+        title = topic.find(fields[0]).text
+        question = topic.find(fields[1]).text
+        answer = topic.find(fields[2]).text
+        disclaimer = topic.find(fields[3]).text
+        t = (title, question, answer, disclaimer)
         topics.append(t)
-        
+
     return topics
 
-def splitter(
-    point:str
-) -> tuple:
-    enc = tiktoken.encoding_for_model(model)
-    q = enc.encode(point)
-    q1 = enc.decode(q[:len(q)//2])
-    q2 = enc.decode(q[len(q)//2:])
-    return q1,q2
+# def splitter(
+#     point:str
+# ) -> tuple:
+#     enc = tiktoken.encoding_for_model(model)
+#     q = enc.encode(point)
+#     q1 = enc.decode(q[:len(q)//2])
+#     q2 = enc.decode(q[len(q)//2:])
+#     return q1,q2
 
 def sim(
    completion:str,
    q2:str     
 )-> float:
-    return ratio(completion,q2)
+    return ratio(q2, completion), scorer.score(references=[q2], candidates=[completion])[0], rouge.evaluate([completion], [[q2]])['rouge-1']['f'] ### for BLEURT I am using the recommended checkpoint and for ROUGE unigram overlap, but I could also compute the longest common sequence or weighted
 
 def complete(
-    q1:str,
-    q2:str
+    year:str,
+    title:str,
+    question:str,
+    answer:str,
+    fields:tuple    
 ) -> str:
-    enc = tiktoken.encoding_for_model(model)
-
-    if model=="text-davinci-003":
+    guided_prompt = f'You are provided with the {fields[0]}, {fields[1]} and {fields[2]} fields of a topic from the TREC {year} Health Misinformation topic set.'\
+    f'Complete the {fields[3]} field of the topic as exactly appeared in the dataset.'\
+    f'Only rely on the original form of the topic in the dataset to complete the narrative field.'\
+    f'\n{fields[0]}:{title}\n{fields[1]}:{question}\n{fields[2]}:{answer}\n{fields[3]}:' 
+    general_prompt = f'Complete the {fields[3]} based on the {fields[0]}, {fields[1]} and {fields[2]} fields such that the {fields[3]} provides an explanation for the {fields[2]} to the given {fields[1]}'\
+    f'\n{fields[0]}:{title}\n{fields[1]}:{question}\n{fields[2]}:{answer}\n{fields[3]}:' 
+    if model=="text-davinci-003" or model=="text-davinci-002":
         text = openai.Completion.create(
             model=model,
-            prompt=q1,
-            max_tokens=len(enc.encode(q2)),
+            prompt=guided_prompt,
+            # max_tokens=len(enc.encode(q2)),
             temperature=0
         )
         return text['choices'][0]['text']
@@ -58,9 +74,9 @@ def complete(
               model=model,
               messages=[
                   {"role": "system", "content": "You are a chatbot"},
-                  {"role": "user", "content": q1},
+                  {"role": "user", "content": guided_prompt},
               ],
-              max_tokens=len(enc.encode(q2)),
+            #   max_tokens=len(enc.encode(q2)),
               temperature=0 # to ensure reproducibility
           )
 
@@ -70,20 +86,34 @@ def complete(
         return result
 
 if __name__ == "__main__":
-    topics = load_benchmark('../benchmark/misinfo-2020-topics.xml')
+    year = sys.argv[1] ### the only param of the script is the year we want to analyse
 
-    matches = 0
+    if year=="2020":
+        fields = ('title', 'description', 'answer', 'narrative')
+    elif year=="2021":
+        fields = ('query', 'description', 'stance', 'narrative')
+    elif year=="2022":
+        fields = ('query', 'question', 'answer', 'background')
+
+    topics = load_benchmark("2021", fields)
+
+    lev, bleu, r = [], [], []
     for topic in topics:
-        q1, q2 = splitter(topic)
-        print(q1)
-        print(q2)
-        compl = complete(q1,q2)
+        compl = complete("2021", topic[0], topic[1], topic[2], fields)    
         print(compl)
-        rat = sim(compl,q2)
-        print(rat)
+        print("Real value:```", topic[3],"```")
+        #### AQUI DUPLICAR LA SIMILARIDAD
+        leven,bleurt,rou = sim(compl,topic[3])
+        print("Levenshtein:",leven, "BLEURT:",bleurt, "ROUGE:", rou)
         print()
-        if rat>threshold:
-            matches+=1
+        lev.append(leven)
+        bleu.append(bleurt)
+        r.append(rou)
+        ###### AQUI TESTS STATS
     
-    print(matches)
-    print(matches/len(topics))
+    print("ALL Levenshtein:",np.mean(leven), "BLEURT:",np.mean(bleu), "ROUGE:", np.mean(r))
+    # if rat>threshold:
+    #     matches+=1
+    
+    # print(matches)
+    # print(matches/len(topics))
